@@ -27,6 +27,7 @@ import {
   parseU32,
   parseUsdc,
   questConsequence,
+  questPeriodConsequence,
   questToggleConsequence,
   readContentAdmins,
   readContractAdmin,
@@ -37,6 +38,7 @@ import {
   validateQuest,
   validateReward,
   validateSupply,
+  validateTip,
   type ContentAdmins,
 } from './admin';
 import type { RewardEntry } from './rewards';
@@ -185,6 +187,26 @@ describe('input checks', () => {
     expect(validateQuest({ id: '5', schemaId: '2', xp: '0' }).ok).toBe(false);
     expect(validateQuest({ id: '5', schemaId: '4294967296', xp: '50' }).ok).toBe(false);
   });
+
+  it('validates a tip like tip() does: amount > 0, and somebody else as the receiver', () => {
+    expect(validateTip({ to: OTHER, amount: '2.5' }, ADMIN)).toEqual({
+      ok: true,
+      value: 25_000_000n,
+    });
+    // #144: a zero or negative tip moves no value, so the contract refuses it.
+    for (const bad of ['0', '0.0', '0.0000000', '-1', 'abc', '']) {
+      expect(validateTip({ to: OTHER, amount: bad }, ADMIN).ok, `amount ${bad}`).toBe(false);
+    }
+    // …and so does a tip to yourself: the SAC moves the balance to itself and `tipped`
+    // would read as a spend received.
+    expect(validateTip({ to: ADMIN, amount: '1' }, ADMIN)).toEqual({
+      ok: false,
+      error: expect.stringContaining('your own wallet'),
+    });
+    // The amount is checked first, exactly as `validate_tip` orders it on-chain.
+    const both = validateTip({ to: ADMIN, amount: '0' }, ADMIN);
+    expect(both).toEqual({ ok: false, error: expect.stringContaining('more than 0') });
+  });
 });
 
 describe('write consequences', () => {
@@ -240,6 +262,22 @@ describe('write consequences', () => {
     expect(questToggleConsequence(q, true)).toContain('award its 50 Earned XP again');
     expect(questToggleConsequence(q, false)).toContain("can't award it");
   });
+
+  it('describes repeating quests (#154)', () => {
+    const q = { id: 5, schemaId: 2, xp: 50n, active: true };
+    expect(questConsequence({ id: 5, schemaId: 2, xp: 50n }, null, 604_800)).toBe(
+      'Quest 5 will award 50 Earned XP (schema 2) once a week to each wallet the attester verifies for it.',
+    );
+    expect(questConsequence({ id: 5, schemaId: 2, xp: 50n }, q, 3 * 86_400)).toContain(
+      'once every 3 days to each wallet',
+    );
+    expect(questConsequence({ id: 5, schemaId: 2, xp: 50n }, q, 604_800)).toContain(
+      'can complete it again next round',
+    );
+    expect(questPeriodConsequence(q, 604_800)).toContain('once a week');
+    expect(questPeriodConsequence(q, 604_800)).toContain('a referral quest can’t repeat');
+    expect(questPeriodConsequence(q, 0)).toContain('one-shot again');
+  });
 });
 
 describe('contract errors', () => {
@@ -266,7 +304,10 @@ describe('contract errors', () => {
         },
       },
       gates: { crate: 'gate', names: { 1: 'NotInitialized', 3: 'GateNotFound', 6: 'BadTrack' } },
-      quests: { crate: 'quest_registry', names: { 1: 'NotInitialized', 4: 'QuestNotFound' } },
+      quests: {
+        crate: 'quest_registry',
+        names: { 1: 'NotInitialized', 4: 'QuestNotFound', 9: 'InvalidPeriod' },
+      },
     } as const;
     for (const [section, { crate, names }] of Object.entries(expected)) {
       const onChain = errorEnum(crate);

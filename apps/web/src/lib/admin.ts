@@ -1,8 +1,13 @@
 /**
- * Admin content management (/admin, issue #296) — the rules behind the page, kept pure so
- * they are unit-tested: who sees the controls, input checks that mirror each contract's own,
- * the plain-language consequence every write is confirmed with, and friendly copy for the
- * contract errors those writes can hit.
+ * Contract-mirroring input rules, kept pure so they are unit-tested: who sees the admin
+ * controls, the checks each write is held to before anyone signs, the plain-language
+ * consequence every write is confirmed with, and friendly copy for the contract errors
+ * those writes can hit.
+ *
+ * Most of it backs the /admin content page (issue #296); `validateTip` is the one
+ * player-facing check, and it lives here because it is the same shape of rule as the rest —
+ * a mirror of a contract guard, in the same order the contract applies it, so a bad
+ * transaction is caught before a signature rather than after.
  *
  * This module does NOT authorize anything. Every content write is `admin.require_auth()`-
  * gated on-chain, so a wallet that isn't the admin can never change content, whatever the
@@ -16,6 +21,7 @@ import { enumKey, gateId, questId, readInstanceValue, rewardsId } from './contra
 import { stroopsToUsdc, usdcToStroops, type RewardEntry } from './rewards';
 import { TRACK, type Gate } from './gate';
 import type { QuestConfig } from './quests';
+import { WEEK_SECS } from './attest';
 import { humanizeError } from './utils';
 
 export type ContentSection = 'rewards' | 'gates' | 'quests';
@@ -23,7 +29,8 @@ export const CONTENT_SECTIONS: ContentSection[] = ['rewards', 'gates', 'quests']
 
 // ── Admin gate ──
 
-/** `DataKey::Admin`: the instance-storage key each contract's `init` stores its admin under. */
+/** `DataKey::Admin`: the instance-storage key each contract's constructor (its `init`, before
+ *  #127) stores its admin under. */
 export const ADMIN_KEY = enumKey('Admin');
 
 /** The admin a contract stores on-chain (`null` if it has none, or isn't deployed). */
@@ -90,8 +97,13 @@ export function parseUsdc(raw: string): Checked<bigint> {
   if (!/^\d+(\.\d{1,7})?$/.test(s)) {
     return fail('Amount must be a USDC number with at most 7 decimals, e.g. 2 or 0.5.');
   }
-  const stroops = usdcToStroops(s);
-  if (stroops <= 0n) return fail('Amount must be more than 0 USDC.');
+  let stroops: bigint;
+  try {
+    stroops = usdcToStroops(s);
+  } catch {
+    // usdcToStroops rejects zero and sub-stroop amounts (never coerces to 0).
+    return fail('Amount must be more than 0 USDC.');
+  }
   if (stroops > I128_MAX) return fail('Amount is too large.');
   return ok(stroops);
 }
@@ -149,6 +161,20 @@ export function validateSupply(
     );
   }
   return ok({ reward, maxClaims: maxClaims.value });
+}
+
+/**
+ * `tip` input (#144). Mirrors the contract's `validate_tip`: the amount must be more than
+ * 0 USDC (`InvalidAmount`) and the receiver must be a DIFFERENT wallet from the sender
+ * (`SelfTip`) — a zero or self tip mints a `tipped` event that moves no value, which
+ * fakes "somebody received a spend" in the feed and the indexer. The same two checks, in
+ * the same order, so a shape the chain would reject never costs a fee to discover.
+ */
+export function validateTip(input: { to: string; amount: string }, from: string): Checked<bigint> {
+  const amount = parseUsdc(input.amount);
+  if (!amount.ok) return amount;
+  if (input.to === from) return fail('That’s your own wallet — enter someone else to tip.');
+  return ok(amount.value);
 }
 
 export interface GateDraft {
@@ -258,13 +284,45 @@ export function gateToggleConsequence(g: Gate, active: boolean): string {
   return `Gate ${g.id} “${g.label}” will be enabled: any wallet with ≥ ${g.min} ${trackName(g.track)} XP passes it.`;
 }
 
-/** `create_quest` saves the quest ACTIVE; replacing one keeps its per-wallet completions. */
-export function questConsequence(d: QuestDraft, current: QuestConfig | null): string {
-  const awards = `Quest ${d.id} will award ${d.xp} Earned XP (schema ${d.schemaId}) once to each wallet the attester verifies for it`;
+/** How often a quest with this repeat period can be completed, for admin copy. */
+function repeatPhrase(periodSecs: number): string {
+  if (periodSecs <= 0) return 'once';
+  if (periodSecs === WEEK_SECS) return 'once a week';
+  return `once every ${Math.round(periodSecs / 86_400)} days`;
+}
+
+/** `create_quest` saves the quest ACTIVE and leaves its repeat period (`periodSecs`, 0 =
+ *  one-shot) alone; replacing one keeps its per-wallet completions. */
+export function questConsequence(
+  d: QuestDraft,
+  current: QuestConfig | null,
+  periodSecs = 0,
+): string {
+  const awards = `Quest ${d.id} will award ${d.xp} Earned XP (schema ${d.schemaId}) ${repeatPhrase(periodSecs)} to each wallet the attester verifies for it`;
   if (!current) return `${awards}.`;
+  const kept =
+    periodSecs > 0
+      ? 'Wallets that completed it this round can complete it again next round.'
+      : "Wallets that already completed it can't complete it again.";
   return (
     `${awards}, replacing ${current.xp} XP (schema ${current.schemaId}).` +
-    `${reEnabled(current.active)} Wallets that already completed it can't complete it again.`
+    `${reEnabled(current.active)} ${kept}`
+  );
+}
+
+/** `set_quest_period`: weekly (`WEEK_SECS`) or back to one-shot (0). */
+export function questPeriodConsequence(q: QuestConfig, periodSecs: number): string {
+  if (periodSecs <= 0) {
+    return (
+      `Quest ${q.id} will be one-shot again: each wallet can complete it once. ` +
+      'Wallets that only completed the repeating version can complete it one more time.'
+    );
+  }
+  return (
+    `Quest ${q.id} will repeat: each wallet can complete it ${repeatPhrase(periodSecs)} ` +
+    '(weeks start Thursday 00:00 UTC). The attester signs a repeating quest only for evidence ' +
+    'dated inside the current round — a PR merged, an invite or vouches claimed — so a ' +
+    'referral quest can’t repeat. Approvals issued before the change stop working.'
   );
 }
 
@@ -299,6 +357,7 @@ export const ADMIN_ERRORS: Record<ContentSection, Record<number, string>> = {
   quests: {
     1: 'The quest registry is not initialized.',
     4: 'That quest doesn’t exist. Create it first.',
+    9: 'A repeat period must be at least a day. Use 0 for a one-shot quest.',
   },
 };
 

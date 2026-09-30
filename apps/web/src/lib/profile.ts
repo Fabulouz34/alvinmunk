@@ -4,6 +4,7 @@
  * client-side cache so returning users skip onboarding.
  */
 import type { AvatarConfig } from './avatar';
+import { readJSON, writeJSON, remove } from './storage';
 
 export interface Profile {
   handle: string;
@@ -14,28 +15,22 @@ export interface Profile {
   avatar?: AvatarConfig;
   /** Short plain-text bio (see `sanitizeBio`), mirrored from the registry's `set_meta`. */
   bio?: string;
+  /** Where the profile was created from, e.g. `claim`. Used for analytics. */
+  source?: string;
 }
 
 const KEY = 'alvinmunk.profile';
 
 export function loadProfile(): Profile | null {
-  if (typeof localStorage === 'undefined') return null;
-  const raw = localStorage.getItem(KEY);
-  if (!raw) return null;
-  try {
-    return JSON.parse(raw) as Profile;
-  } catch {
-    return null;
-  }
+  return readJSON<Profile | null>(KEY, null);
 }
 
 export function saveProfile(p: Profile): void {
-  if (typeof localStorage === 'undefined') return;
-  localStorage.setItem(KEY, JSON.stringify(p));
+  writeJSON(KEY, p);
 }
 
 export function clearProfile(): void {
-  if (typeof localStorage !== 'undefined') localStorage.removeItem(KEY);
+  remove(KEY);
 }
 
 /** Normalize a user-typed handle: lowercase, alnum + underscore, <= 20 chars. */
